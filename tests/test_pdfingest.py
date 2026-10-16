@@ -397,3 +397,58 @@ def test_ocr_error_falls_back_to_gemini(tmp_path, monkeypatch):
 
     code, report = run(str(tmp_path / "in"), "-o", str(tmp_path / "b"), "--ocr")      # no Gemini to fall back on
     assert code == 1 and report["files"][0]["status"] == "incomplete"
+
+
+@docling
+def test_empty_gemini_answer_is_retried(tmp_path, monkeypatch):
+    """Gemini answering with nothing (not even NO_TEXT) is a failure, so the PDF is retried.
+    The Gemini client is replaced, so no request leaves the machine."""
+    from google import genai
+
+    class EmptyAnswer:
+        class models:
+            @staticmethod
+            def generate_content(model, contents):
+                return type("Response", (), {"text": "  "})()
+
+    monkeypatch.setattr(P, "_gemini_client", None)
+    monkeypatch.setattr(P, "gemini_key", lambda: "test-key")
+    monkeypatch.setattr(genai, "Client", lambda api_key: EmptyAnswer())
+    (tmp_path / "in").mkdir()
+    make_pdf(tmp_path / "in" / "doc.pdf")
+    code, report = run(str(tmp_path / "in"), "-o", str(tmp_path / "out"), "--gemini")
+    record = report["files"][0]
+    assert code == 1 and record["status"] == "incomplete"
+    assert record["embedded_images"][0]["gemini_error"] == "Gemini returned no text"
+
+
+@docling
+def test_rejected_ocr_without_gemini_is_reported(tmp_path, monkeypatch):
+    """Rejected OCR with nothing else to try is a final result: reported, not retried forever.
+    Adding --gemini changes the settings, so the PDF is processed again."""
+    monkeypatch.setattr(P.sys, "platform", "darwin")
+    monkeypatch.setattr(P, "ocr_image", lambda image, box: ("Xqzt Vrrl Pkkm", 0.3, 1))
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: ("Words from Gemini", None))
+    folder, out = tmp_path / "in", str(tmp_path / "out")
+    folder.mkdir()
+    make_pdf(folder / "doc.pdf")
+
+    _, report = run(str(folder), "-o", out, "--ocr")
+    record = report["files"][0]
+    assert record["status"] == "success" and record["unread_images"] == ["p1: low confidence (0.3)"]
+    _, report = run(str(folder), "-o", out, "--ocr", "--gemini")
+    assert report["files"][0]["status"] == "success"
+    assert report["files"][0]["embedded_images"][0]["source"] == "gemini"
+
+
+@docling
+def test_missing_image_file_is_not_skipped(tmp_path):
+    folder, out = tmp_path / "in", tmp_path / "out"
+    folder.mkdir()
+    make_pdf(folder / "doc.pdf")
+    _, report = run(str(folder), "-o", str(out))
+    png = out / report["files"][0]["embedded_images"][0]["saved_as"]
+    png.unlink()
+
+    _, report = run(str(folder), "-o", str(out))
+    assert report["files"][0]["status"] == "success" and png.exists()

@@ -467,7 +467,8 @@ def read_image_with_gemini(image, page_no):
     for attempt in range(1, 6):                          # up to 5 tries
         try:
             response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
-            return (response.text or "").strip() or None, None
+            text = (response.text or "").strip()
+            return (text, None) if text else (None, "Gemini returned no text")   # NO_TEXT is an answer; empty is not
         except Exception as e:
             if "503" in str(e) and attempt < 5:
                 print(f"   p{page_no}: Gemini busy, retrying in {10 * attempt} s")
@@ -574,7 +575,7 @@ def process_pdf(converter, pdf, manifest, settings):
     file_hash = sha_256(pdf)
     known = manifest.get(file_hash)
     if known and not FORCE and known.get("settings") == settings \
-            and all((OUT_DIR / name).exists() for name in known["outputs"].values()):
+            and all((OUT_DIR / name).exists() for name in output_files(known)):
         # keep the saved results, so report.json still shows them for skipped files
         return {**known, "file": pdf.name, "status": "skipped", "parsed_status": known["status"],
                 "reason": f"same file already processed with the same settings as {known['file']}"}
@@ -611,6 +612,12 @@ def process_pdf(converter, pdf, manifest, settings):
     # it is not cached, so the next run tries again.
     failed_images = [f"p{img['page']}: {img['gemini_error'] or img['ocr_error']}" for img in images
                      if img["status"] == "not read" and (img["gemini_error"] or img["ocr_error"])]
+    # Read, but the result was rejected or empty, with nothing left to try (e.g. OCR failed the checks and
+    # --gemini is off). Running again with the same settings gives the same result, so this is not retried;
+    # it is reported instead. Adding --gemini changes the settings, so the PDF is then processed again.
+    unread_images = [f"p{img['page']}: {img['ocr_check']}" for img in images
+                     if img["status"] == "not read" and not (img["gemini_error"] or img["ocr_error"])
+                     and img["ocr_check"] not in ("OCR off", "image too small, not read")]
     status = result.status.value
     if status == ConversionStatus.SUCCESS.value and failed_images:
         status = "incomplete"
@@ -634,6 +641,7 @@ def process_pdf(converter, pdf, manifest, settings):
             "pictures_added": sum(1 for img in images if img["picture_added"]),
         },
         "chunks": len(chunks),
+        "unread_images": unread_images,
         "embedded_images": images,
         "outputs": {"json": f"{stem}.json", "md": f"{stem}.md", "jsonl": f"{stem}.jsonl"},
         "settings": settings,
@@ -649,6 +657,9 @@ def print_summary(r):
     print(f"status {r['status']} | {r['pages']} pages | {r['seconds']} s | {r['chunks']} chunks")
     if r["status"] == "incomplete":
         print("   some images could not be read; this PDF will be processed again next run")
+    if r.get("unread_images"):
+        print(f"   not read: {'; '.join(r['unread_images'])}"
+              + ("" if USE_GEMINI else " (add --gemini to read them)"))
     print(f"text read: {t['percent_read']}% of {t['reference_words']} words "
           f"(missing {t['missing_words']}, extra {t['extra_words']}) - image text not included")
     if t["flagged_pages"]:

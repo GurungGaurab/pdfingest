@@ -63,9 +63,11 @@ pdfingest report.pdf --ocr --gemini
 | `--force` | Process every PDF again, even if nothing changed |
 | `--table-mode` | `accurate` (default) or `fast` |
 
-A PDF is skipped when it was already processed with exactly the same settings: OCR, Gemini model and prompt, pages, table mode, `--furniture`, `--no-images`, the quality thresholds and the package versions. Change any of them and it is processed again, with its old outputs replaced.
+A PDF is skipped when it was already processed with exactly the same settings: OCR, Gemini model and prompt, pages, table mode, `--furniture`, `--no-images`, the quality thresholds and the package versions. Change any of them, or delete any of its output files (including the PNG and `.txt` files), and it is processed again, with its old outputs replaced.
 
-The exit code is 0 when every PDF succeeded or was skipped, and 1 otherwise. A PDF whose images could not all be read (e.g. Gemini was busy, or OCR raised an error and there was no Gemini to fall back on) is marked `incomplete`. It is not cached, so the next run tries it again. Reprocessing a PDF first removes its old entry from the manifest, so a failed or incomplete rerun is never skipped later.
+The exit code is 0 when every PDF succeeded or was skipped, and 1 otherwise. A PDF whose images could not all be read (e.g. Gemini was busy or answered with nothing, or OCR raised an error and there was no Gemini to fall back on) is marked `incomplete`. It is not cached, so the next run tries it again. Reprocessing a PDF first removes its old entry from the manifest, so a failed or incomplete rerun is never skipped later.
+
+An image whose OCR result was rejected, with no `--gemini` to fall back on, is not an error: running again with the same settings would give the same result. It is listed under `unread_images` in `report.json` and in the terminal summary. Add `--gemini` and the PDF is processed again.
 
 For Gemini, get a key in [Google AI Studio](https://aistudio.google.com/) and put it in a `.env` file in the folder you run from (or next to `pdfingest.py`):
 
@@ -150,6 +152,9 @@ The tests make their own small PDFs with fpdf2. They cover:
 - a failed image being retried on the next run
 - a failed rerun (e.g. `--force` while Gemini is down) not being skipped afterwards
 - an OCR error falling back to Gemini
+- an empty Gemini answer being retried
+- rejected OCR without Gemini being reported, and read once `--gemini` is added
+- a deleted image file making the PDF be processed again
 - changed settings (e.g. `--pages`) not being skipped, and `--force`
 - rejected OCR text never reaching the outputs
 - image text with no layout picture getting a picture in reading order
