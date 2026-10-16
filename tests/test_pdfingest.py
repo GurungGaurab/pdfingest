@@ -165,6 +165,11 @@ def test_added_picture_goes_in_reading_order():
     again = DoclingDocument.model_validate_json(doc.model_dump_json())   # survives the JSON round trip
     assert again.pictures[0].meta.description.text == "Text from the image"
 
+    top = BoundingBox(l=50, t=20, r=500, b=80, coord_origin=CoordOrigin.TOPLEFT)   # above everything on page 1
+    P.add_picture(doc, 1, top, 800, "Image at the top", "ocr")
+    md = doc.export_to_markdown()
+    assert md.index("Image at the top") < md.index("Para A")
+
 
 def test_settings_change_the_cache_key(monkeypatch):
     first = P.cache_settings()
@@ -348,3 +353,47 @@ def test_furniture_option(tmp_path):
         for text in furniture:
             assert (text in md) is bool(option)
             assert (json.dumps(text)[1:-1] in chunks) is bool(option)
+
+
+@docling
+def test_failed_reprocessing_is_not_skipped(tmp_path, monkeypatch):
+    """success, then --force while Gemini is down (incomplete), then a normal run must process it again."""
+    folder, out = tmp_path / "in", tmp_path / "out"
+    folder.mkdir()
+    make_pdf(folder / "doc.pdf")
+
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: ("Words from Gemini", None))
+    _, report = run(str(folder), "-o", str(out), "--gemini")
+    file_hash = report["files"][0]["sha256"]
+    assert report["files"][0]["status"] == "success"
+
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: (None, "ServerError: 503 UNAVAILABLE"))
+    _, report = run(str(folder), "-o", str(out), "--gemini", "--force")
+    assert report["files"][0]["status"] == "incomplete"
+    assert file_hash not in json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: ("Words from Gemini", None))
+    _, report = run(str(folder), "-o", str(out), "--gemini")
+    record = report["files"][0]
+    assert record["status"] == "success"
+    assert "Words from Gemini" in (out / record["outputs"]["md"]).read_text(encoding="utf-8")
+
+
+@docling
+def test_ocr_error_falls_back_to_gemini(tmp_path, monkeypatch):
+    def broken_ocr(image, box):
+        raise RuntimeError("Vision request failed")
+
+    monkeypatch.setattr(P.sys, "platform", "darwin")
+    monkeypatch.setattr(P, "ocr_image", broken_ocr)
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: ("Words from Gemini", None))
+    (tmp_path / "in").mkdir()
+    make_pdf(tmp_path / "in" / "doc.pdf")
+
+    code, report = run(str(tmp_path / "in"), "-o", str(tmp_path / "a"), "--ocr", "--gemini")
+    image = report["files"][0]["embedded_images"][0]
+    assert code == 0 and report["files"][0]["status"] == "success"
+    assert image["source"] == "gemini" and "Vision request failed" in image["ocr_error"]
+
+    code, report = run(str(tmp_path / "in"), "-o", str(tmp_path / "b"), "--ocr")      # no Gemini to fall back on
+    assert code == 1 and report["files"][0]["status"] == "incomplete"

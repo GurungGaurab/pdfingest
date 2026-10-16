@@ -65,7 +65,7 @@ pdfingest report.pdf --ocr --gemini
 
 A PDF is skipped when it was already processed with exactly the same settings: OCR, Gemini model and prompt, pages, table mode, `--furniture`, `--no-images`, the quality thresholds and the package versions. Change any of them and it is processed again, with its old outputs replaced.
 
-The exit code is 0 when every PDF succeeded or was skipped, and 1 otherwise. A PDF whose images could not all be read (e.g. Gemini was busy) is marked `incomplete`. It is not cached, so the next run tries it again.
+The exit code is 0 when every PDF succeeded or was skipped, and 1 otherwise. A PDF whose images could not all be read (e.g. Gemini was busy, or OCR raised an error and there was no Gemini to fall back on) is marked `incomplete`. It is not cached, so the next run tries it again. Reprocessing a PDF first removes its old entry from the manifest, so a failed or incomplete rerun is never skipped later.
 
 For Gemini, get a key in [Google AI Studio](https://aistudio.google.com/) and put it in a `.env` file in the folder you run from (or next to `pdfingest.py`):
 
@@ -123,7 +123,7 @@ Chunks come from Docling's `HierarchicalChunker`: one chunk per paragraph, list,
 3. **OCR (with `--ocr`).** pdfingest runs Apple's OCR on each stored image itself, enlarging small images first. Docling's own OCR is turned off, because it would put OCR text into the document before it could be checked. The OCR result is kept only if:
    - its average confidence is at least 0.95, and
    - at least 95% of its words are real words: common English (wordfreq) or words that appear in the PDF's own text.
-4. **Gemini (with `--gemini`).** Images that fail the OCR checks go to Gemini. The prompt asks for self-contained lines (full dates, row and column headings) and `NO_TEXT` for photos and logos.
+4. **Gemini (with `--gemini`).** Images that fail the OCR checks, or where OCR raised an error, go to Gemini. The prompt asks for self-contained lines (full dates, row and column headings) and `NO_TEXT` for photos and logos.
 5. **Put the text back.** The text becomes the description of the picture inside the image. Docling's Markdown export and chunker both include it. If the layout model found no picture there, pdfingest adds one at the image's page and position, so the text is in the JSON, the Markdown and the chunks either way.
 
 Only text that passed the checks (or came from Gemini) ever enters the document. Rejected OCR text is kept only in `report.json`, as scores.
@@ -148,6 +148,8 @@ The tests make their own small PDFs with fpdf2. They cover:
 - a broken PDF not stopping the run
 - a missing Gemini key being reported rather than crashing
 - a failed image being retried on the next run
+- a failed rerun (e.g. `--force` while Gemini is down) not being skipped afterwards
+- an OCR error falling back to Gemini
 - changed settings (e.g. `--pages`) not being skipped, and `--force`
 - rejected OCR text never reaching the outputs
 - image text with no layout picture getting a picture in reading order

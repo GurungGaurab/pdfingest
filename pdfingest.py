@@ -207,25 +207,31 @@ def place_text(doc, layout_pictures, text, source):
 def add_picture(doc, page_no, box, page_height, text, source):
     """The layout model found no picture for this image: add one to the document, at the image's
     page and position, carrying the text. It goes after the last top-level item on that page that
-    starts above the image (or after the previous page's last item), so the JSON, the Markdown and
-    the chunks all get the text in roughly the right place. Returns the new picture's ref."""
+    starts above the image (or after the previous page's last item); if there is none, before the
+    first item that follows it. So the JSON, the Markdown and the chunks all get the text in roughly
+    the right place. Returns the new picture's ref."""
     layers = content_layers()
-    before = None
+    before, following = None, None
     for item, _ in doc.iterate_items(included_content_layers=layers):
         if not isinstance(item, DocItem) or not item.prov or item.parent is None or item.parent.cref != "#/body":
             continue
         first = item.prov[0]
+        if first.page_no < page_no or (first.page_no == page_no
+                                       and first.bbox.to_top_left_origin(page_height).t <= box.t):
+            before = item
+        elif following is None:
+            following = item                     # first item after the image, in reading order
         if first.page_no > page_no:
             break                                # reached the next pages
-        if first.page_no < page_no or first.bbox.to_top_left_origin(page_height).t <= box.t:
-            before = item
     prov = ProvenanceItem(page_no=page_no, charspan=(0, 0),
                           bbox=BoundingBox(l=box.l, t=box.t, r=box.r, b=box.b, coord_origin=CoordOrigin.TOPLEFT)
                           .to_bottom_left_origin(page_height))
     if before is not None:
         picture = doc.insert_picture(sibling=before, prov=prov, after=True)
+    elif following is not None:
+        picture = doc.insert_picture(sibling=following, prov=prov, after=False)
     else:
-        picture = doc.add_picture(prov=prov)
+        picture = doc.add_picture(prov=prov)       # the document has no other items
     picture.meta = PictureMeta(description=DescriptionMetaField(text=text, created_by=created_by(source)))
     return picture.self_ref
 
@@ -275,10 +281,15 @@ def embedded_images(result, stem, vocabulary, page_words):
                 image.save(OUT_DIR / saved_as)
 
             # Read the text inside the image: OCR if it passes the checks, otherwise Gemini
-            ocr_text, ocr_confidence, ocr_lines = "", None, 0
+            ocr_text, ocr_confidence, ocr_lines, ocr_error = "", None, 0, None
             if DO_OCR and image is not None and share >= MIN_IMAGE_SHARE:
-                ocr_text, ocr_confidence, ocr_lines = ocr_image(image, box)
+                try:
+                    ocr_text, ocr_confidence, ocr_lines = ocr_image(image, box)
+                except Exception as e:           # one image must not fail the PDF; Gemini can still read it
+                    ocr_error = f"{type(e).__name__}: {e}"
             ocr_ok, word_share, check_reason = check_ocr(ocr_text, ocr_confidence, vocabulary)
+            if ocr_error:
+                check_reason = f"OCR failed ({ocr_error})"
             text, source, gemini_error = None, None, None
             if share < MIN_IMAGE_SHARE:
                 check_reason = "image too small, not read"
@@ -321,6 +332,7 @@ def embedded_images(result, stem, vocabulary, page_words):
                 "real_word_share": word_share,
                 "ocr_check": check_reason,
                 "source": source,                       # "ocr", "gemini" or None
+                "ocr_error": ocr_error,
                 "gemini_error": gemini_error,
                 "text_file": text_file,
                 "placed_in": placed_in,                 # picture that now carries the text
@@ -550,6 +562,14 @@ def output_files(record):
     return files
 
 
+def save_manifest(manifest):
+    """Write manifest.json in one step (temporary file, then rename), so it is never half written."""
+    path = OUT_DIR / "manifest.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
 def process_pdf(converter, pdf, manifest, settings):
     file_hash = sha_256(pdf)
     known = manifest.get(file_hash)
@@ -559,6 +579,10 @@ def process_pdf(converter, pdf, manifest, settings):
         return {**known, "file": pdf.name, "status": "skipped", "parsed_status": known["status"],
                 "reason": f"same file already processed with the same settings as {known['file']}"}
     if known:
+        # Forget the old result before touching its outputs: if this run fails or is incomplete,
+        # the next run must not skip the PDF because of the old success.
+        del manifest[file_hash]
+        save_manifest(manifest)
         for name in output_files(known):     # remove the old outputs, so none are left over from other settings
             (OUT_DIR / name).unlink(missing_ok=True)
 
@@ -583,9 +607,10 @@ def process_pdf(converter, pdf, manifest, settings):
         for chunk in chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
-    # An image that should have been read but failed (e.g. Gemini busy) makes the result incomplete:
+    # An image that should have been read but failed (e.g. Gemini busy, OCR error) makes the result incomplete:
     # it is not cached, so the next run tries again.
-    failed_images = [f"p{img['page']}: {img['gemini_error']}" for img in images if img["gemini_error"]]
+    failed_images = [f"p{img['page']}: {img['gemini_error'] or img['ocr_error']}" for img in images
+                     if img["status"] == "not read" and (img["gemini_error"] or img["ocr_error"])]
     status = result.status.value
     if status == ConversionStatus.SUCCESS.value and failed_images:
         status = "incomplete"
@@ -727,10 +752,10 @@ def main(argv=None):
             record = {"file": pdf.name, "status": "failed", "error": f"{type(e).__name__}: {e}"}
         if record["status"] == ConversionStatus.SUCCESS.value:
             manifest[record["sha256"]] = record   # only full successes are skipped next time (failed, incomplete: retried)
+            save_manifest(manifest)               # saved as each PDF finishes, so a crash later loses nothing
         records.append(record)
         print_summary(record)
 
-    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     report = {
         "run_at": datetime.now().isoformat(timespec="seconds"),
         "settings": {
