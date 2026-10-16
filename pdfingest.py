@@ -7,10 +7,10 @@ Run:     python pdfingest.py                      every PDF in input/ -> output/
 Output (<name> = file name + first 8 characters of its SHA-256):
   <name>.md                    Markdown with front matter; text read from an image sits under that picture
   <name>.jsonl                 one chunk per line: text + headings, pages and source (ready for embedding)
-  <name>.json                  full DoclingDocument (lossless; positions, pages, tables, image text)
+  <name>.json                  full DoclingDocument (positions, pages, tables, image text)
   <name>_p<N>_stored_<i>.png   embedded images (unless --no-images)
   <name>_p<N>_stored_<i>.txt   text read from that image, if any
-  manifest.json                sha256 -> result; files already processed are skipped
+  manifest.json                sha256 -> result; files already processed with the same settings are skipped
   report.json                  settings, versions and one record per PDF
 """
 
@@ -31,11 +31,12 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from docling.datamodel.backend_options import ThreadedDoclingParseBackendOptions
 from docling.datamodel.base_models import ConversionStatus, InputFormat
-from docling.datamodel.pipeline_options import OcrMacOptions, PdfPipelineOptions, TableFormerMode, TableStructureOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode, TableStructureOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.transforms.chunker import HierarchicalChunker
 from docling_core.transforms.chunker.hierarchical_chunker import ChunkingDocSerializer, ChunkingSerializerProvider
-from docling_core.types.doc import ContentLayer, DescriptionMetaField, PictureItem, PictureMeta
+from docling_core.types.doc import (BoundingBox, ContentLayer, CoordOrigin, DescriptionMetaField, DocItem,
+                                    PictureItem, PictureMeta, ProvenanceItem)
 
 
 # Defaults. The command-line options change these (python pdfingest.py --help).
@@ -47,6 +48,7 @@ TABLE_MODE = TableFormerMode.ACCURATE
 PAGE_RANGE = None                       # e.g. (1, 8); None = whole file
 SAVE_IMAGES = True                      # write each embedded image as a PNG
 KEEP_FURNITURE = False                  # True = page headers, footers and page numbers also go into the Markdown and chunks
+FORCE = False                           # True = process every PDF again, even if nothing changed
 
 IMAGE_ONLY_SHARE = 0.3                  # image covers more than 30% of the page...
 IMAGE_ONLY_WORDS = 30                   # ...and the page's own text layer has fewer than 30 words -> image-only page
@@ -54,6 +56,7 @@ FLAG_MISSING = 0.05                     # flag a page if more than 5% of its tex
 MIN_MISSING = 3                         # ...and at least 3 words are missing (avoids noise on near-empty pages)
 
 # Reading the text inside images: OCR first, Gemini only when the OCR result looks poor
+OCR_SCALE = 3                           # OCR an image at (at least) 3 pixels per PDF point, like Docling's own OCR
 CONFIDENCE_MIN = 0.95                   # OCR is trusted only if its average confidence is at least this...
 REAL_WORD_MIN = 0.95                    # ...and at least this share of its words are real words
 REAL_WORD_ZIPF = 3.0                    # a word counts as real if it is common English (wordfreq) or appears in the PDF's own text
@@ -105,14 +108,14 @@ def pages_of(item):# every page an item sits on (one paragraph can cross a page 
 
 #Docling
 def build_converter():
+    # Docling's own OCR stays off: it would put OCR text into the document before it can be checked.
+    # pdfingest runs OCR itself on each stored image (ocr_image) and only adds text that passes the checks.
     options = PdfPipelineOptions(
-        do_ocr=DO_OCR,
+        do_ocr=False,
         do_table_structure=True,
         table_structure_options=TableStructureOptions(mode=TABLE_MODE),
         generate_parsed_pages=True,     # keep bitmap_resources (embedded images) after parsing
     )
-    if DO_OCR:
-        options.ocr_options = OcrMacOptions()   # reads layout regions with no PDF text or with an image
     return DocumentConverter(format_options={
         InputFormat.PDF: PdfFormatOption(
             pipeline_options=options,
@@ -150,18 +153,20 @@ def real_word_share(text, vocabulary):
     return round(real / len(candidates), 3)
 
 
-def ocr_inside(page, box, page_height):
-    """OCR'd lines that sit mostly inside one image, in reading order, with their average confidence."""
-    lines = []
-    for cell in page.parsed_page.textline_cells:
-        if not cell.from_ocr:
-            continue
-        cell_box = cell.rect.to_bounding_box().to_top_left_origin(page_height)
-        if cell_box.area() > 0 and box.intersection_area_with(cell_box) / cell_box.area() > 0.5:
-            lines.append((cell_box.t, cell_box.l, cell.text, cell.confidence))
-    lines.sort()
-    text = "\n".join(line[2] for line in lines)
-    confidence = round(sum(line[3] for line in lines) / len(lines), 3) if lines else None
+def ocr_image(image, box):
+    """Apple OCR (ocrmac) on one stored image. Small images are enlarged first, to at least
+    OCR_SCALE pixels per PDF point (box = where the image sits on the page, in points).
+    Returns (text in reading order, average confidence, number of lines)."""
+    from ocrmac import ocrmac
+
+    scale = min(4.0, OCR_SCALE * box.width / image.width)
+    if scale > 1:
+        image = image.resize((round(image.width * scale), round(image.height * scale)))
+    lines = ocrmac.OCR(image, recognition_level="accurate").recognize()
+    # Vision gives boxes as fractions of the image, measured from the bottom left: sort top to bottom, then left to right
+    lines.sort(key=lambda line: (round(1 - line[2][1] - line[2][3], 3), line[2][0]))
+    text = "\n".join(line[0] for line in lines)
+    confidence = round(sum(line[1] for line in lines) / len(lines), 3) if lines else None
     return text, confidence, len(lines)
 
 
@@ -194,17 +199,47 @@ def place_text(doc, layout_pictures, text, source):
             continue
         if pic.meta is None:
             pic.meta = PictureMeta()
-        created_by = f"gemini:{GEMINI_MODEL}" if source == "gemini" else "ocrmac"
-        pic.meta.description = DescriptionMetaField(text=text, created_by=created_by)
+        pic.meta.description = DescriptionMetaField(text=text, created_by=created_by(source))
         return ref
     return None
 
 
+def add_picture(doc, page_no, box, page_height, text, source):
+    """The layout model found no picture for this image: add one to the document, at the image's
+    page and position, carrying the text. It goes after the last top-level item on that page that
+    starts above the image (or after the previous page's last item), so the JSON, the Markdown and
+    the chunks all get the text in roughly the right place. Returns the new picture's ref."""
+    layers = content_layers()
+    before = None
+    for item, _ in doc.iterate_items(included_content_layers=layers):
+        if not isinstance(item, DocItem) or not item.prov or item.parent is None or item.parent.cref != "#/body":
+            continue
+        first = item.prov[0]
+        if first.page_no > page_no:
+            break                                # reached the next pages
+        if first.page_no < page_no or first.bbox.to_top_left_origin(page_height).t <= box.t:
+            before = item
+    prov = ProvenanceItem(page_no=page_no, charspan=(0, 0),
+                          bbox=BoundingBox(l=box.l, t=box.t, r=box.r, b=box.b, coord_origin=CoordOrigin.TOPLEFT)
+                          .to_bottom_left_origin(page_height))
+    if before is not None:
+        picture = doc.insert_picture(sibling=before, prov=prov, after=True)
+    else:
+        picture = doc.add_picture(prov=prov)
+    picture.meta = PictureMeta(description=DescriptionMetaField(text=text, created_by=created_by(source)))
+    return picture.self_ref
+
+
+def created_by(source):
+    return f"gemini:{GEMINI_MODEL}" if source == "gemini" else "ocrmac"
+
+
 def embedded_images(result, stem, vocabulary, page_words):
     """One record per image stored in the PDF, read from bitmap_resources
-    (a fact from the file, not a guess by the layout model). With OCR on, each image's
-    OCR text is checked; images that fail go to Gemini if USE_GEMINI is on.
-    Text that is read is also put into the document (see place_text)."""
+    (a fact from the file, not a guess by the layout model). With OCR on, each image is
+    OCR'd and the result checked; images that fail go to Gemini if USE_GEMINI is on.
+    Text that is read is put into the document (place_text, or add_picture if the layout
+    model found no picture there)."""
     doc = result.document
     records = []
 
@@ -232,13 +267,17 @@ def embedded_images(result, stem, vocabulary, page_words):
                         layout_pictures.append(pic.self_ref)
 
             image = bmp.image.pil_image if bmp.image is not None else None
+            if image is not None and image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")      # e.g. CMYK or transparent images, which PNG/OCR can't take as they are
             saved_as = None
             if image is not None and SAVE_IMAGES:
                 saved_as = f"{stem}_p{page_no}_stored_{i}.png"
                 image.save(OUT_DIR / saved_as)
 
             # Read the text inside the image: OCR if it passes the checks, otherwise Gemini
-            ocr_text, ocr_confidence, ocr_lines = ocr_inside(page, box, size.height)
+            ocr_text, ocr_confidence, ocr_lines = "", None, 0
+            if DO_OCR and image is not None and share >= MIN_IMAGE_SHARE:
+                ocr_text, ocr_confidence, ocr_lines = ocr_image(image, box)
             ocr_ok, word_share, check_reason = check_ocr(ocr_text, ocr_confidence, vocabulary)
             text, source, gemini_error = None, None, None
             if share < MIN_IMAGE_SHARE:
@@ -256,11 +295,14 @@ def embedded_images(result, stem, vocabulary, page_words):
             else:
                 status = "not read"
 
-            text_file, placed_in = None, None
+            text_file, placed_in, picture_added = None, None, False
             if status.startswith("read"):
                 text_file = f"{stem}_p{page_no}_stored_{i}.txt"
                 (OUT_DIR / text_file).write_text(text, encoding="utf-8")
                 placed_in = place_text(doc, layout_pictures, text, source)
+                if placed_in is None:
+                    placed_in = add_picture(doc, page_no, box, size.height, text, source)
+                    picture_added = True
 
             image_only = share > IMAGE_ONLY_SHARE and page_words[page_no] < IMAGE_ONLY_WORDS
             records.append({
@@ -281,25 +323,17 @@ def embedded_images(result, stem, vocabulary, page_words):
                 "source": source,                       # "ocr", "gemini" or None
                 "gemini_error": gemini_error,
                 "text_file": text_file,
-                "placed_in": placed_in,                 # picture that now carries the text; None = not placed
+                "placed_in": placed_in,                 # picture that now carries the text
+                "picture_added": picture_added,         # True = no layout picture fitted, pdfingest added one
                 "status": status,
             })
     return records
 
 
-def unplaced(images):
-    """Images whose text was read but has no picture in the document to sit under."""
-    return [img for img in images if img["text_file"] and not img["placed_in"]]
-
-
-def read_text(img):
-    return (OUT_DIR / img["text_file"]).read_text(encoding="utf-8")
-
-
 def picture_labels(doc, images):
     """Label every layout-model picture: inside an embedded image -> embedded, else not matched
     (no embedded image found under it; it may be drawn, or span several images)."""
-    embedded = {ref: img["status"] for img in images for ref in img["layout_pictures"]}
+    embedded = {ref: img["status"] for img in images for ref in img["layout_pictures"] + [img["placed_in"]] if ref}
     labels = {}
     for pic in doc.pictures:
         pages = ", ".join(f"p{p}" for p in pages_of(pic)) or "p?"
@@ -325,17 +359,6 @@ def labelled_markdown(doc, labels):
     for ref, part in zip(order, parts[1:]):
         out += f"<!-- {labels.get(ref, 'picture')} -->" + part
     return out, True
-
-
-def unplaced_markdown(images):
-    """Text from images the layout model found no picture for, added at the end of the Markdown."""
-    missing = unplaced(images)
-    if not missing:
-        return ""
-    out = "\n\n## Text from images not placed in the document\n"
-    for img in missing:
-        out += f"\n<!-- embedded image (p{img['page']}): text {img['status']} -->\n\n{read_text(img).strip()}\n"
-    return out
 
 
 # Front matter
@@ -376,8 +399,7 @@ class LayerSerializers(ChunkingSerializerProvider):
 def chunk_records(doc, pdf_name, file_hash, images):
     """One record per chunk, for embedding. A chunk is a heading's section split into its
     paragraphs, lists, tables and pictures (Docling's HierarchicalChunker); 'text' starts
-    with the headings it sits under. Image text is in the chunk of its picture; images with
-    no picture get a chunk of their own at the end."""
+    with the headings it sits under. Image text is in the chunk of its picture."""
     image_source = {img["placed_in"]: img["source"] for img in images if img["placed_in"]}
     chunker = HierarchicalChunker(serializer_provider=LayerSerializers())
     records = []
@@ -391,15 +413,6 @@ def chunk_records(doc, pdf_name, file_hash, images):
             "pages": sorted({p.page_no for item in items for p in item.prov}),
             "from_image": bool(sources),
             "image_text_by": sources[0] if len(sources) == 1 else (sources or None),
-        })
-
-    for img in unplaced(images):
-        records.append({
-            "text": read_text(img).strip(),
-            "headings": [],
-            "pages": [img["page"]],
-            "from_image": True,
-            "image_text_by": img["source"],
         })
 
     return [{"id": f"{file_hash[:8]}-{i}", "source": pdf_name, "sha256": file_hash, "chunk_index": i, **r}
@@ -514,13 +527,40 @@ def text_check(doc, pdf_path):
 
 
 
-def process_pdf(converter, pdf, manifest):
+def cache_settings():
+    """Everything that changes the outputs. A PDF is only skipped if it was processed with exactly these."""
+    return {
+        "ocr": DO_OCR,
+        "gemini": {"model": GEMINI_MODEL, "prompt_sha256": hashlib.sha256(GEMINI_PROMPT.encode()).hexdigest()[:12]}
+                  if USE_GEMINI else None,
+        "pages": list(PAGE_RANGE) if PAGE_RANGE else None,
+        "table_mode": TABLE_MODE.value,
+        "furniture": KEEP_FURNITURE,
+        "save_images": SAVE_IMAGES,
+        "checks": [CONFIDENCE_MIN, REAL_WORD_MIN, REAL_WORD_ZIPF, MIN_IMAGE_SHARE, OCR_SCALE],
+        "versions": package_versions(),
+    }
+
+
+def output_files(record):
+    """Every file a processed PDF wrote."""
+    files = list(record.get("outputs", {}).values())
+    for img in record.get("embedded_images", []):
+        files += [name for name in (img.get("saved_as"), img.get("text_file")) if name]
+    return files
+
+
+def process_pdf(converter, pdf, manifest, settings):
     file_hash = sha_256(pdf)
     known = manifest.get(file_hash)
-    if known and all((OUT_DIR / name).exists() for name in known["outputs"].values()):
+    if known and not FORCE and known.get("settings") == settings \
+            and all((OUT_DIR / name).exists() for name in known["outputs"].values()):
         # keep the saved results, so report.json still shows them for skipped files
         return {**known, "file": pdf.name, "status": "skipped", "parsed_status": known["status"],
-                "reason": f"same file already processed as {known['file']}"}
+                "reason": f"same file already processed with the same settings as {known['file']}"}
+    if known:
+        for name in output_files(known):     # remove the old outputs, so none are left over from other settings
+            (OUT_DIR / name).unlink(missing_ok=True)
 
     start = time.perf_counter()
     result = converter.convert(pdf, page_range=PAGE_RANGE) if PAGE_RANGE else converter.convert(pdf)
@@ -529,12 +569,13 @@ def process_pdf(converter, pdf, manifest):
     stem = f"{pdf.stem}_{file_hash[:8]}"   # first 8 characters of the hash: each version of a file gets its own outputs
 
     vocabulary, page_words = pdf_text_layer(pdf)
+    layout_pictures = len(doc.pictures)
     images = embedded_images(result, stem, vocabulary, page_words)   # also puts image text into doc
     doc.save_as_json(OUT_DIR / f"{stem}.json")
 
     labels = picture_labels(doc, images)
     md, labels_applied = labelled_markdown(doc, labels)
-    md = front_matter(pdf, file_hash, len(doc.pages)) + md + unplaced_markdown(images)
+    md = front_matter(pdf, file_hash, len(doc.pages)) + md
     (OUT_DIR / f"{stem}.md").write_text(md, encoding="utf-8")
 
     chunks = chunk_records(doc, pdf.name, file_hash, images)
@@ -542,27 +583,35 @@ def process_pdf(converter, pdf, manifest):
         for chunk in chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
+    # An image that should have been read but failed (e.g. Gemini busy) makes the result incomplete:
+    # it is not cached, so the next run tries again.
+    failed_images = [f"p{img['page']}: {img['gemini_error']}" for img in images if img["gemini_error"]]
+    status = result.status.value
+    if status == ConversionStatus.SUCCESS.value and failed_images:
+        status = "incomplete"
+
     return {
         "file": pdf.name,
         "sha256": file_hash,
-        "status": result.status.value,
-        "errors": [str(e) for e in result.errors],
+        "status": status,
+        "errors": [str(e) for e in result.errors] + [f"image not read: {e}" for e in failed_images],
         "parsed_at": datetime.now().isoformat(timespec="seconds"),
         "pages": len(doc.pages),
         "seconds": seconds,
         "text_check": text_check(doc, pdf),
         "pictures": {
             "stored_images": len(images),
-            "layout_model_pictures": len(doc.pictures),
+            "layout_model_pictures": layout_pictures,
             "labelled_embedded": sum(1 for v in labels.values() if v.startswith("embedded")),
             "labelled_not_matched": sum(1 for v in labels.values() if v.startswith("picture not matched")),
             "markdown_labels_applied": labels_applied,
             "image_text_placed": sum(1 for img in images if img["placed_in"]),
-            "image_text_unplaced": len(unplaced(images)),
+            "pictures_added": sum(1 for img in images if img["picture_added"]),
         },
         "chunks": len(chunks),
         "embedded_images": images,
         "outputs": {"json": f"{stem}.json", "md": f"{stem}.md", "jsonl": f"{stem}.jsonl"},
+        "settings": settings,
     }
 
 
@@ -573,6 +622,8 @@ def print_summary(r):
         return
     t, p = r["text_check"], r["pictures"]
     print(f"status {r['status']} | {r['pages']} pages | {r['seconds']} s | {r['chunks']} chunks")
+    if r["status"] == "incomplete":
+        print("   some images could not be read; this PDF will be processed again next run")
     print(f"text read: {t['percent_read']}% of {t['reference_words']} words "
           f"(missing {t['missing_words']}, extra {t['extra_words']}) - image text not included")
     if t["flagged_pages"]:
@@ -590,7 +641,7 @@ def print_summary(r):
 
 def package_versions():
     found = {}
-    for pkg in ("docling", "docling-core", "docling-parse", "pypdfium2", "ocrmac", "wordfreq", "google-genai"):
+    for pkg in ("pdfingest", "docling", "docling-core", "docling-parse", "pypdfium2", "ocrmac", "wordfreq", "google-genai"):
         try:
             found[pkg] = version(pkg)
         except PackageNotFoundError:
@@ -620,6 +671,8 @@ def parse_args(argv):
     parser.add_argument("--gemini-model", default=GEMINI_MODEL, help=f"default: {GEMINI_MODEL}")
     parser.add_argument("--pages", type=page_range, help="only these pages, e.g. 5 or 1-8")
     parser.add_argument("--no-images", action="store_true", help="do not save embedded images as PNG")
+    parser.add_argument("--force", action="store_true",
+                        help="process every PDF again, even if it was already processed with the same settings")
     parser.add_argument("--furniture", action="store_true",
                         help="keep page headers, footers and page numbers in the Markdown and chunks")
     parser.add_argument("--table-mode", choices=["accurate", "fast"], default="accurate",
@@ -645,12 +698,13 @@ def find_pdfs(inputs):
 
 
 def main(argv=None):
-    global OUT_DIR, DO_OCR, USE_GEMINI, GEMINI_MODEL, TABLE_MODE, PAGE_RANGE, SAVE_IMAGES, KEEP_FURNITURE
+    global OUT_DIR, DO_OCR, USE_GEMINI, GEMINI_MODEL, TABLE_MODE, PAGE_RANGE, SAVE_IMAGES, KEEP_FURNITURE, FORCE
     args = parse_args(argv)
     OUT_DIR = Path(args.output)
     DO_OCR, USE_GEMINI, GEMINI_MODEL = args.ocr, args.gemini, args.gemini_model
     TABLE_MODE = TableFormerMode.FAST if args.table_mode == "fast" else TableFormerMode.ACCURATE
     PAGE_RANGE, SAVE_IMAGES, KEEP_FURNITURE = args.pages, not args.no_images, args.furniture
+    FORCE = args.force
 
     pdfs, problems = find_pdfs(args.inputs)
     for problem in problems:
@@ -663,15 +717,16 @@ def main(argv=None):
     manifest_file = OUT_DIR / "manifest.json"
     manifest = json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.exists() else {}
     converter = build_converter()
+    settings = cache_settings()
 
     records = []
     for pdf in pdfs:
         try:
-            record = process_pdf(converter, pdf, manifest)
+            record = process_pdf(converter, pdf, manifest, settings)
         except Exception as e:           # one bad PDF must not stop the rest
             record = {"file": pdf.name, "status": "failed", "error": f"{type(e).__name__}: {e}"}
         if record["status"] == ConversionStatus.SUCCESS.value:
-            manifest[record["sha256"]] = record   # only full successes are skipped next time
+            manifest[record["sha256"]] = record   # only full successes are skipped next time (failed, incomplete: retried)
         records.append(record)
         print_summary(record)
 
@@ -682,7 +737,8 @@ def main(argv=None):
             "inputs": args.inputs,
             "backend": "docling-parse (default), include_bitmap_images=True",
             "do_ocr": DO_OCR,
-            "ocr_engine": "ocrmac" if DO_OCR else None,
+            "ocr_engine": "ocrmac, run by pdfingest on each stored image (Docling's own OCR is off)" if DO_OCR else None,
+            "force": FORCE,
             "use_gemini": USE_GEMINI,
             "gemini_model": GEMINI_MODEL if USE_GEMINI else None,
             "ocr_checks": f"confidence >= {CONFIDENCE_MIN} and real-word share >= {REAL_WORD_MIN} "

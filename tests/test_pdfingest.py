@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from fpdf import FPDF
 from PIL import Image, ImageDraw
-from docling_core.types.doc import ContentLayer, DocItemLabel, DoclingDocument
+from docling_core.types.doc import BoundingBox, ContentLayer, CoordOrigin, DocItemLabel, DoclingDocument, ProvenanceItem
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pdfingest as P  # noqa: E402
@@ -27,13 +27,18 @@ class FooterPDF(FPDF):
         self.cell(0, 10, f"pdfingest test footer - page {self.page_no()}", align="C")
 
 
-def make_pdf(path, title="Test document", extra="", footer=False):
-    """A heading, two paragraphs and an embedded image; with footer=True, two pages with a footer on each."""
+def sample_image():
     image = Image.new("RGB", (900, 360), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle([20, 20, 880, 340], outline="navy", width=8)
     draw.rectangle([60, 80, 300, 280], fill="orange")
     draw.text((340, 160), "TEXT INSIDE THE IMAGE", fill="black", font_size=40)
+    return image
+
+
+def make_pdf(path, title="Test document", extra="", footer=False):
+    """A heading, two paragraphs and an embedded image; with footer=True, two pages with a footer on each."""
+    image = sample_image()
 
     pdf = FooterPDF() if footer else FPDF()
     pdf.set_title(title)
@@ -132,12 +137,42 @@ def test_furniture_in_markdown_and_chunks(monkeypatch, keep):
 @pytest.mark.parametrize("keep", [False, True])
 def test_image_text_not_hidden_in_furniture(monkeypatch, keep):
     """Text read from an image is only attached to a picture that will be exported;
-    otherwise place_text returns None and the text goes to the 'not placed' section."""
+    otherwise place_text returns None and pdfingest adds a body picture for the text instead."""
     monkeypatch.setattr(P, "KEEP_FURNITURE", keep)
     doc, picture = small_doc()
     placed = P.place_text(doc, [picture.self_ref], "Logo text", "ocr")
     assert placed == (picture.self_ref if keep else None)
     assert (picture.meta is not None and picture.meta.description is not None) is keep
+
+
+def test_added_picture_goes_in_reading_order():
+    """Image text with no layout picture becomes a new picture, placed by page and height."""
+    def prov(page, top):
+        box = BoundingBox(l=50, t=top, r=500, b=top + 20, coord_origin=CoordOrigin.TOPLEFT)
+        return ProvenanceItem(page_no=page, bbox=box.to_bottom_left_origin(800), charspan=(0, 1))
+
+    doc = DoclingDocument(name="order")
+    for page, top, text in [(1, 100, "Para A"), (1, 500, "Para B"), (2, 100, "Para C")]:
+        doc.add_text(label=DocItemLabel.TEXT, text=text, prov=prov(page, top))
+    box = BoundingBox(l=50, t=300, r=500, b=450, coord_origin=CoordOrigin.TOPLEFT)
+    ref = P.add_picture(doc, 1, box, 800, "Text from the image", "ocr")
+
+    md = doc.export_to_markdown()
+    assert md.index("Para A") < md.index("Text from the image") < md.index("Para B")
+    picture = doc.pictures[0]
+    assert picture.self_ref == ref and picture.prov[0].page_no == 1
+    assert picture.meta.description.created_by == "ocrmac"
+    again = DoclingDocument.model_validate_json(doc.model_dump_json())   # survives the JSON round trip
+    assert again.pictures[0].meta.description.text == "Text from the image"
+
+
+def test_settings_change_the_cache_key(monkeypatch):
+    first = P.cache_settings()
+    monkeypatch.setattr(P, "PAGE_RANGE", (1, 1))
+    assert P.cache_settings() != first
+    monkeypatch.setattr(P, "PAGE_RANGE", None)
+    monkeypatch.setattr(P, "DO_OCR", not P.DO_OCR)
+    assert P.cache_settings() != first
 
 
 # ---------------------------------------------------------------- full runs (real Docling)
@@ -224,10 +259,75 @@ def test_gemini_without_key_is_reported_not_crashed(tmp_path, no_gemini_key):
     (tmp_path / "in").mkdir()
     make_pdf(tmp_path / "in" / "doc.pdf")
     code, report = run(str(tmp_path / "in"), "-o", str(tmp_path / "out"), "--gemini")
-    image = report["files"][0]["embedded_images"][0]
+    record = report["files"][0]
+    image = record["embedded_images"][0]
 
-    assert code == 0
+    assert code == 1 and record["status"] == "incomplete"
     assert image["status"] == "not read" and "GEMINI_API_KEY" in image["gemini_error"]
+
+
+@docling
+def test_failed_image_is_retried_next_run(tmp_path, monkeypatch):
+    folder, out = tmp_path / "in", str(tmp_path / "out")
+    folder.mkdir()
+    make_pdf(folder / "doc.pdf")
+
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: (None, "ServerError: 503 UNAVAILABLE"))
+    code, report = run(str(folder), "-o", out, "--gemini")
+    assert code == 1 and report["files"][0]["status"] == "incomplete"
+
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: ("Words from Gemini", None))
+    code, report = run(str(folder), "-o", out, "--gemini")
+    record = report["files"][0]
+    assert code == 0 and record["status"] == "success"
+    assert "Words from Gemini" in (tmp_path / "out" / record["outputs"]["md"]).read_text(encoding="utf-8")
+
+    _, report = run(str(folder), "-o", out, "--gemini")
+    assert report["files"][0]["status"] == "skipped"
+
+
+@docling
+def test_changed_settings_are_not_skipped(tmp_path):
+    folder, out = tmp_path / "in", str(tmp_path / "out")
+    folder.mkdir()
+    make_pdf(folder / "doc.pdf", footer=True)                 # two pages
+
+    _, report = run(str(folder), "-o", out, "--pages", "1")
+    assert report["files"][0]["pages"] == 1
+    _, report = run(str(folder), "-o", out)
+    assert report["files"][0]["status"] == "success" and report["files"][0]["pages"] == 2
+    _, report = run(str(folder), "-o", out)
+    assert report["files"][0]["status"] == "skipped"
+    _, report = run(str(folder), "-o", out, "--force")
+    assert report["files"][0]["status"] == "success"
+
+
+@docling
+def test_rejected_ocr_never_reaches_the_outputs(tmp_path, monkeypatch):
+    """OCR text that fails the checks must not appear anywhere; Gemini's reading replaces it.
+    OCR and Gemini are simulated, so this runs on any system."""
+    monkeypatch.setattr(P.sys, "platform", "darwin")
+    monkeypatch.setattr(P, "ocr_image", lambda image, box: ("Xqzt Vrrl Pkkm", 0.3, 1))
+    monkeypatch.setattr(P, "read_image_with_gemini", lambda image, page_no: ("Words from Gemini", None))
+    (tmp_path / "in").mkdir()
+    make_pdf(tmp_path / "in" / "doc.pdf")
+    code, report = run(str(tmp_path / "in"), "-o", str(tmp_path / "out"), "--ocr", "--gemini")
+    record = report["files"][0]
+
+    assert code == 0 and record["embedded_images"][0]["source"] == "gemini"
+    for name in record["outputs"].values():
+        text = (tmp_path / "out" / name).read_text(encoding="utf-8")
+        assert "Xqzt" not in text
+        assert "Words from Gemini" in text
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Apple OCR only runs on macOS")
+def test_real_ocr_reads_the_image():
+    image = sample_image()
+    box = BoundingBox(l=0, t=0, r=480, b=192, coord_origin=CoordOrigin.TOPLEFT)   # 170 mm wide on the page
+    text, confidence, lines = P.ocr_image(image, box)
+    assert "INSIDE THE IMAGE" in text.upper()
+    assert lines >= 1 and 0 < confidence <= 1
 
 
 @docling
