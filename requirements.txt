@@ -1,0 +1,7 @@
+docling==2.135.0
+docling-core==2.101.0
+docling-parse==7.22.2
+pypdfium2==5.14.0
+ocrmac==1.0.1; sys_platform == "darwin"
+wordfreq==3.1.1
+google-genai==2.31.0
